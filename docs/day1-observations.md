@@ -1,3 +1,1 @@
-The shortest case, E12, used 228 input tokens and finished in 2233 ms, while the longest case, E11, used 274 input tokens and finished in 4713 ms. Input length rose only about 20 percent, but latency more than doubled because the longer document also produced 107 output tokens versus 50 for E12. Time and tokens scale with generation as well as prompt size. 
-Higher latency on first call for the run on the first call, Ollama has to load the model from disk 
-
+The shortest case, E12, used 228 input tokens and finished in 2020 ms, while the longest case, E11, used 274 input tokens and took 4287 ms. Input size rose only about 20 percent, but latency more than doubled because E11 also produced more than twice as many output tokens (107 vs 50). A short document therefore underestimates model workload: latency scales with both prompt length and the longer completions that fuller documents tend to elicit.
