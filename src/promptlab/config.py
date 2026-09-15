@@ -17,6 +17,21 @@ PII_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?<!\d)(?:\+1[-. ]?)?\(?\d{3}\)?[-. ]\d{3}[-. ]\d{4}(?!\d)"),
 )
 
+OUTCOME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bloan\b.{0,40}\bgranted\b", re.IGNORECASE),
+    re.compile(r"\bgranted\b.{0,40}\bloan\b", re.IGNORECASE),
+    re.compile(r"\byou are approved\b", re.IGNORECASE),
+    re.compile(r"\b(has been|have been|was|were) approved\b", re.IGNORECASE),
+    re.compile(r"\bwe have (approved|resolved|closed|granted|credited)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(request|dispute|complaint|application) "
+        r"(has been|have been|was|is now) (approved|resolved|closed|granted)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\brefund (has been|was|is) (issued|posted|approved)\b", re.IGNORECASE),
+    re.compile(r"\bidentity (has been|is|was) (confirmed|verified)\b", re.IGNORECASE),
+)
+
 
 @dataclass(frozen=True)
 class ModelConfig:
