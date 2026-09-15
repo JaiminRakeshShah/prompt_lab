@@ -73,7 +73,12 @@ def build_request(
         system=(
             f"Return only a JSON instance of {schema.__name__}. "
             "Do not return JSON Schema. Do not include $defs, properties, type, "
-            "required, title, or additionalProperties. Do not use Markdown fences."
+            "required, title, or additionalProperties. Do not use Markdown fences. "
+            "Do not add keys that are not in the schema. "
+            "value must be a string, a list of strings, or null — never an object. "
+            "An absent field is {\"value\": null, \"status\": \"absent\"}. "
+            "A present citation must be the full heading line copied from the source "
+            '(for example "1. Document Control"), not a number, label, or invented heading.'
         ),
         user_content=render_prompt(template, schema, case["source"]),
         temperature=TEMPERATURE,
