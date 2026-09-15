@@ -30,15 +30,9 @@ For evidence-bearing fields:
 
 use status: "present" only when the value is supported by the source
 
-value must be a string, a list of strings, or null. Never a nested object. Do not put status or citation inside value.
+when a field is present, set citation to the exact section heading that supports the value
 
-when a field is present, set citation to the full heading line copied from the source, e.g. "1. Document Control", not "1"
-
-do not invent or rename headings. If the source heading is "2. Attendees", citation is "2. Attendees", not "2. Date"
-
-a date on meeting notes or a newsletter issue date is not effective_date unless the source names it as the procedure's effective date
-
-when a field is absent, use {"value": null, "status": "absent"}, not {"status": "absent"}
+use the schema's absent representation when the source does not provide the field
 
 use the schema's ambiguous representation when the source is conflicting or unclear
 
