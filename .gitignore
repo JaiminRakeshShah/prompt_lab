@@ -1,5 +1,6 @@
 .env
 .venv/
+.cursor/rules/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
