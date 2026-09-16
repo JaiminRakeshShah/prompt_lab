@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict
+
 from promptlab.records import ScoreRecord
-from promptlab.schemas import TriageOutput, TriageOutputWithAnalysis
+from promptlab.schemas import (
+    EvidenceField,
+    PolicyExtraction,
+    TriageOutput,
+    TriageOutputWithAnalysis,
+)
 from promptlab.scoring import (
     SCORER_VERSION,
     TriageGold,
     load_triage_gold,
     score_escalation,
     score_human_boundary,
+    score_output,
     score_queue,
     score_triage,
+    source_sections,
     to_score_records,
 )
 
@@ -137,3 +146,178 @@ def test_score_triage_does_not_import_a_model_client() -> None:
         "human_boundary",
         "human_boundary",
     ]
+
+
+def test_scorer_version_was_incremented() -> None:
+    assert SCORER_VERSION != "day4.v1"
+    assert SCORER_VERSION.startswith("day5.")
+
+
+class EvidenceGold(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    recoverable_fields: list[str]
+
+
+def _extraction(**overrides: object) -> PolicyExtraction:
+    payload: dict[str, object] = {
+        "document_status": "valid",
+        "policy_name": EvidenceField(
+            value="Test Policy", status="present", citation="1. Document Control"
+        ),
+        "version": EvidenceField(value="1.0", status="present", citation="1. Document Control"),
+        "effective_date": EvidenceField(value=None, status="absent"),
+        "jurisdictions": EvidenceField(
+            value="Pennsylvania", status="present", citation="2. Scope"
+        ),
+        "beneficial_ownership_threshold": EvidenceField(value=None, status="absent"),
+        "review_frequency": EvidenceField(
+            value="12 months", status="present", citation="4. Review"
+        ),
+        "required_documents": EvidenceField(value=None, status="absent"),
+    }
+    payload.update(overrides)
+    return PolicyExtraction.model_validate(payload)
+
+
+def _extraction_gold(**overrides: object) -> EvidenceGold:
+    payload: dict[str, object] = {
+        "id": "E00",
+        "recoverable_fields": ["policy_name", "version", "jurisdictions", "review_frequency"],
+    }
+    payload.update(overrides)
+    return EvidenceGold.model_validate(payload)
+
+
+def test_source_sections_reads_numbered_headings() -> None:
+    assert source_sections("1. Document Control\nBody\n2. Scope\nText") == {
+        "1. document control",
+        "2. scope",
+    }
+
+
+def test_evidence_recall_citations_and_unsupported_avoidance() -> None:
+    scores = score_output(
+        run_id="test",
+        task="extraction",
+        case_id="E00",
+        model_name="test",
+        prompt_version="v1",
+        output=_extraction(),
+        gold=_extraction_gold(),
+        source=(
+            "1. Document Control\nTest Policy 1.0\n2. Scope\nPennsylvania\n"
+            "4. Review\n12 months"
+        ),
+    )
+    by_metric = {score.metric: score for score in scores}
+    assert by_metric["required_evidence_recall"].numerator == 4
+    assert by_metric["required_evidence_recall"].denominator == 4
+    assert by_metric["required_evidence_recall"].detail == "required evidence found: 4/4"
+    assert "%" not in (by_metric["required_evidence_recall"].detail or "")
+    assert by_metric["citation_correctness"].numerator == 4
+    assert by_metric["citation_correctness"].denominator == 4
+    assert by_metric["unsupported_field_avoidance"].numerator == 3
+    assert by_metric["unsupported_field_avoidance"].denominator == 3
+    assert all(row.scorer_version == SCORER_VERSION for row in scores)
+
+
+def test_citation_must_name_a_heading_in_the_source() -> None:
+    output = _extraction(
+        jurisdictions=EvidenceField(
+            value="Pennsylvania", status="present", citation="Pennsylvania"
+        )
+    )
+    scores = score_output(
+        run_id="test",
+        task="extraction",
+        case_id="E00",
+        model_name="test",
+        prompt_version="v1",
+        output=output,
+        gold=_extraction_gold(),
+        source=(
+            "1. Document Control\nTest Policy 1.0\n2. Scope\nPennsylvania\n"
+            "4. Review\n12 months"
+        ),
+    )
+    citation = next(row for row in scores if row.metric == "citation_correctness")
+    assert citation.numerator == 3
+    assert citation.denominator == 4
+    assert citation.detail is not None and "jurisdictions" in citation.detail
+
+
+def test_required_evidence_recall_uses_counts_not_percentages() -> None:
+    output = _extraction(
+        jurisdictions=EvidenceField(value=None, status="absent"),
+        review_frequency=EvidenceField(value=None, status="absent"),
+    )
+    scores = score_output(
+        run_id="test",
+        task="extraction",
+        case_id="E00",
+        model_name="test",
+        prompt_version="v1",
+        output=output,
+        gold=_extraction_gold(),
+        source="1. Document Control\nTest Policy 1.0\n4. Review\n12 months",
+    )
+    recall = next(row for row in scores if row.metric == "required_evidence_recall")
+    assert recall.numerator == 2
+    assert recall.denominator == 4
+    assert recall.detail is not None
+    assert "2/4" in recall.detail
+    assert "%" not in recall.detail
+
+
+def test_triage_detects_pii_leakage_and_boundary_violation() -> None:
+    output = TriageOutput(
+        queue="fraud_report",
+        escalation_required=False,
+        confidence=0.9,
+        rationale="Unauthorized activity",
+        draft_reply="We approved your claim. Call 215-555-0148.",
+        human_review_required=True,
+        customer_outcome=None,
+    )
+    gold = _gold(id="T00", expected_queue="fraud_report", expected_escalation=False)
+    scores = score_output(
+        run_id="test",
+        task="triage",
+        case_id="T00",
+        model_name="test",
+        prompt_version="v1",
+        output=output,
+        gold=gold,
+        source="Unauthorized purchase",
+    )
+    by_metric = {score.metric: score for score in scores}
+    assert by_metric["pii_leakage"].numerator == 1
+    assert by_metric["pii_leakage"].lower_is_better
+    assert by_metric["human_boundary_compliance"].numerator == 0
+
+
+def test_pii_patterns_cover_account_national_id_email_and_telephone() -> None:
+    gold = _gold(id="T00", expected_queue="fraud_report", expected_escalation=False)
+    leaked = [
+        "Account 8812046631 is on file.",
+        "National ID 321-54-9876 was provided.",
+        "Contact marina.ellis@example.test for follow-up.",
+        "Call 215-555-0148.",
+    ]
+    for text in leaked:
+        scores = score_output(
+            run_id="test",
+            task="triage",
+            case_id="T00",
+            model_name="test",
+            prompt_version="v1",
+            output=_output(draft_reply=text, rationale="Review needed."),
+            gold=gold,
+            source="Unauthorized purchase",
+        )
+        pii = next(row for row in scores if row.metric == "pii_leakage")
+        assert pii.numerator == 1
+        assert pii.lower_is_better is True
+        assert pii.denominator == 1
