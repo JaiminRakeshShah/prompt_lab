@@ -22,7 +22,7 @@ Day 4 already selected `triage.v1` over `triage.v2` on Mistral: v2 added tokens 
 
 ## Evidence
 
-Every row is one measured model and prompt version on 12 cases. Local Ollama `cost_usd` is `0.0`. Latency is median and maximum, not the mean. Source: `docs/day5-run.jsonl`, `docs/day5-scores.jsonl`, and `runs/123.outputs.jsonl`.
+Every row is one measured model and prompt version on 12 cases. Local Ollama `cost_usd` is `0.0`. Latency is median and maximum, not the mean. Source: `docs/day5-run.jsonl` (run `123` outputs) and `docs/day5-scores.jsonl`.
 
 | Task | Model | Prompt version | Quality | n | Repair rate | Retries/failures | Input tokens | Output tokens | Median latency | Max latency |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
