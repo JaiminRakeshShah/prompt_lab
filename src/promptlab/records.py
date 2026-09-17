@@ -20,6 +20,7 @@ class UsageRecord(Record):
     case_id: str
     model_name: str
     model_id: str
+    prompt_id: str
     prompt_version: str
     attempt: int
     kind: Literal["primary", "transport_retry", "repair", "repair_retry"]
@@ -37,6 +38,7 @@ class OutputRecord(Record):
     case_id: str
     model_name: str
     model_id: str
+    prompt_id: str
     prompt_version: str
     succeeded: bool
     repairs: int
@@ -49,6 +51,8 @@ class ScoreRecord(Record):
     task: TaskName
     case_id: str
     model_name: str
+    model_id: str
+    prompt_id: str
     prompt_version: str
     scorer_version: str
     metric: str
@@ -56,6 +60,27 @@ class ScoreRecord(Record):
     denominator: int
     lower_is_better: bool = False
     detail: str | None = None
+
+
+SCORE_CALL_JOIN_FIELDS = (
+    "run_id",
+    "case_id",
+    "task",
+    "model_id",
+    "prompt_id",
+    "prompt_version",
+)
+
+
+def join_key(record: object) -> tuple[object, ...]:
+    """Return the score-to-call join tuple.
+
+    A score row maps to the call attempts that share this key. Multiple
+    attempts (repairs or transport retries) are still exact matches — the
+    lookup does not drop to model name or prompt version alone.
+    """
+
+    return tuple(getattr(record, name) for name in SCORE_CALL_JOIN_FIELDS)
 
 
 def append_record(path: Path, record: Record) -> None:

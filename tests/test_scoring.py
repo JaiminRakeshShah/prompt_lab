@@ -18,6 +18,7 @@ from promptlab.scoring import (
     score_output,
     score_queue,
     score_triage,
+    score_version_selection,
     source_sections,
     to_score_records,
 )
@@ -95,6 +96,25 @@ def test_human_boundary_rejects_final_outcome_language() -> None:
     assert bad_by_field["customer_outcome"].passed is True
 
 
+def test_human_boundary_rejects_refund_approve_deny_and_resolved() -> None:
+    allowed = score_human_boundary(
+        _output(draft_reply="We will review the duplicate charge and work to resolve it."),
+        _gold(),
+    )
+    assert all(row.passed for row in allowed)
+    forbidden = [
+        "We will refund the duplicate charge tomorrow.",
+        "Your claim has been denied.",
+        "The issue has been resolved.",
+        "We've updated the address on your accounts.",
+        "We deny this dispute.",
+    ]
+    for text in forbidden:
+        result = score_human_boundary(_output(draft_reply=text), _gold())
+        by_field = {row.field: row for row in result}
+        assert by_field["draft_reply"].passed is False, text
+
+
 def test_score_records_use_existing_contract_and_v2_output() -> None:
     output = TriageOutputWithAnalysis.model_validate(
         {
@@ -106,6 +126,8 @@ def test_score_records_use_existing_contract_and_v2_output() -> None:
         run_id="score-run",
         case_id="T01",
         model_name="mistral",
+        model_id="mistral:7b",
+        prompt_id="triage",
         prompt_version="v2",
         output=output,
         gold=_gold(),
@@ -137,6 +159,7 @@ def test_score_triage_does_not_import_a_model_client() -> None:
     source = inspect.getsource(scoring)
     assert "OllamaAdapter" not in source
     assert "httpx" not in source
+    assert "select_current_version" in source
     results = score_triage(_output(), _gold())
     assert [row.metric for row in results] == [
         "queue",
@@ -158,6 +181,9 @@ class EvidenceGold(BaseModel):
 
     id: str
     recoverable_fields: list[str]
+    version_group: str | None = None
+    expected_current_case_id: str | None = None
+    as_of: str | None = None
 
 
 def _extraction(**overrides: object) -> PolicyExtraction:
@@ -203,6 +229,8 @@ def test_evidence_recall_citations_and_unsupported_avoidance() -> None:
         task="extraction",
         case_id="E00",
         model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
         prompt_version="v1",
         output=_extraction(),
         gold=_extraction_gold(),
@@ -234,6 +262,8 @@ def test_citation_must_name_a_heading_in_the_source() -> None:
         task="extraction",
         case_id="E00",
         model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
         prompt_version="v1",
         output=output,
         gold=_extraction_gold(),
@@ -258,6 +288,8 @@ def test_required_evidence_recall_uses_counts_not_percentages() -> None:
         task="extraction",
         case_id="E00",
         model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
         prompt_version="v1",
         output=output,
         gold=_extraction_gold(),
@@ -287,6 +319,8 @@ def test_triage_detects_pii_leakage_and_boundary_violation() -> None:
         task="triage",
         case_id="T00",
         model_name="test",
+        model_id="fixture-model",
+        prompt_id="triage",
         prompt_version="v1",
         output=output,
         gold=gold,
@@ -312,6 +346,8 @@ def test_pii_patterns_cover_account_national_id_email_and_telephone() -> None:
             task="triage",
             case_id="T00",
             model_name="test",
+            model_id="fixture-model",
+            prompt_id="triage",
             prompt_version="v1",
             output=_output(draft_reply=text, rationale="Review needed."),
             gold=gold,
@@ -321,3 +357,95 @@ def test_pii_patterns_cover_account_national_id_email_and_telephone() -> None:
         assert pii.numerator == 1
         assert pii.lower_is_better is True
         assert pii.denominator == 1
+
+
+def _version_labels() -> list[EvidenceGold]:
+    shared: dict[str, object] = {
+        "recoverable_fields": [],
+        "version_group": "small-business-periodic-kyc",
+        "expected_current_case_id": "E02",
+        "as_of": "2025-06-01",
+    }
+    return [
+        EvidenceGold.model_validate({"id": "E01", **shared}),
+        EvidenceGold.model_validate({"id": "E02", **shared}),
+    ]
+
+
+def _dated_extraction(version: str, effective: str) -> PolicyExtraction:
+    return _extraction(
+        version=EvidenceField(
+            value=version, status="present", citation="1. Document Control"
+        ),
+        effective_date=EvidenceField(
+            value=effective, status="present", citation="1. Document Control"
+        ),
+    )
+
+
+def test_version_selection_scores_select_current_version() -> None:
+    records = score_version_selection(
+        run_id="test",
+        task="extraction",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        labels=_version_labels(),
+        outputs={
+            "E01": _dated_extraction("1.0", "2024-01-01"),
+            "E02": _dated_extraction("2.0", "2025-01-01"),
+        },
+    )
+    assert len(records) == 1
+    row = records[0]
+    assert row.metric == "version_selection_accuracy"
+    assert row.case_id == "version:small-business-periodic-kyc"
+    assert row.numerator == 1
+    assert row.denominator == 1
+    assert row.detail is None
+    assert row.scorer_version == SCORER_VERSION
+
+
+def test_version_selection_failure_is_attributed_to_bad_extraction() -> None:
+    records = score_version_selection(
+        run_id="test",
+        task="extraction",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        labels=_version_labels(),
+        outputs={
+            "E01": _extraction(),
+            "E02": _dated_extraction("2.0", "2025-01-01"),
+        },
+    )
+    row = records[0]
+    assert row.numerator == 0
+    assert row.detail is not None
+    assert "bad extraction" in row.detail
+    assert "E01" in row.detail
+    assert "expected=E02" in row.detail
+
+
+def test_version_selection_equal_dates_are_scored_from_the_rule() -> None:
+    records = score_version_selection(
+        run_id="test",
+        task="extraction",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        labels=_version_labels(),
+        outputs={
+            "E01": _dated_extraction("1.0", "2025-01-01"),
+            "E02": _dated_extraction("2.0", "2025-01-01"),
+        },
+    )
+    row = records[0]
+    assert row.numerator == 0
+    assert row.detail is not None
+    assert "bad extraction" not in row.detail
+    assert "selected=none" in row.detail
+    assert "expected=E02" in row.detail

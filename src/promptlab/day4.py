@@ -131,6 +131,8 @@ def main() -> str:
                         run_id=record.run_id,
                         case_id=record.case_id,
                         model_name=record.model_name,
+                        model_id=record.model_id,
+                        prompt_id=record.prompt_id,
                         prompt_version=record.prompt_version,
                         output=parsed,
                         gold=gold[case["id"]],

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
 from promptlab.config import OUTCOME_PATTERNS, PII_PATTERNS, PROJECT_ROOT
 from promptlab.records import ScoreRecord, append_record
+from promptlab.rules import VersionCandidate, select_current_version
 from promptlab.schemas import (
     EvidenceField,
     PolicyExtraction,
@@ -278,6 +281,8 @@ def score_output(
     task: TaskName,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     output: BaseModel,
     gold: BaseModel,
@@ -298,6 +303,8 @@ def score_output(
             task=task,
             case_id=case_id,
             model_name=model_name,
+            model_id=model_id,
+            prompt_id=prompt_id,
             prompt_version=prompt_version,
             result=result,
         )
@@ -311,6 +318,8 @@ def failure_scores(
     task: TaskName,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     gold: BaseModel,
 ) -> list[ScoreRecord]:
@@ -338,6 +347,8 @@ def failure_scores(
             task=task,
             case_id=case_id,
             model_name=model_name,
+            model_id=model_id,
+            prompt_id=prompt_id,
             prompt_version=prompt_version,
             scorer_version=SCORER_VERSION,
             metric=metric,
@@ -350,11 +361,101 @@ def failure_scores(
     ]
 
 
+def score_version_selection(
+    *,
+    run_id: str,
+    task: TaskName,
+    model_name: str,
+    model_id: str,
+    prompt_id: str,
+    prompt_version: str,
+    labels: Sequence[BaseModel],
+    outputs: Mapping[str, BaseModel],
+) -> list[ScoreRecord]:
+    """Score current-version choice from extracted dates via select_current_version."""
+    grouped: dict[str, list[BaseModel]] = defaultdict(list)
+    for label in labels:
+        group = getattr(label, "version_group", None)
+        if isinstance(group, str) and group:
+            grouped[group].append(label)
+
+    records: list[ScoreRecord] = []
+    for group_name, group_labels in grouped.items():
+        if len(group_labels) < 2:
+            continue
+        expected = next(
+            (
+                value
+                for value in (
+                    getattr(label, "expected_current_case_id", None) for label in group_labels
+                )
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        as_of_raw = next(
+            (
+                value
+                for value in (getattr(label, "as_of", None) for label in group_labels)
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        if expected is None or as_of_raw is None:
+            continue
+
+        candidates: list[VersionCandidate] = []
+        missing: list[str] = []
+        for label in group_labels:
+            case_id = str(getattr(label, "id", ""))
+            output = outputs.get(case_id)
+            candidate = _version_candidate(case_id, output) if output is not None else None
+            if candidate is None:
+                missing.append(case_id)
+            else:
+                candidates.append(candidate)
+
+        selected = select_current_version(candidates, date.fromisoformat(as_of_raw))
+        selected_id = selected.case_id if selected is not None else "none"
+        passed = (
+            not missing and selected is not None and selected.case_id == expected
+        )
+        if missing:
+            detail = (
+                "bad extraction: missing version/effective_date for "
+                + ", ".join(missing)
+                + f"; expected={expected}; selected={selected_id}"
+            )
+        elif not passed:
+            detail = f"expected={expected}; selected={selected_id}"
+        else:
+            detail = None
+        records.append(
+            ScoreRecord(
+                run_id=run_id,
+                task=task,
+                case_id=f"version:{group_name}",
+                model_name=model_name,
+                model_id=model_id,
+                prompt_id=prompt_id,
+                prompt_version=prompt_version,
+                scorer_version=SCORER_VERSION,
+                metric="version_selection_accuracy",
+                numerator=int(passed),
+                denominator=1,
+                detail=detail,
+            )
+        )
+    return records
+
+
 def to_score_records(
     *,
     run_id: str,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     output: TriageOutput,
     gold: TriageGold,
@@ -365,6 +466,8 @@ def to_score_records(
             task="triage",
             case_id=case_id,
             model_name=model_name,
+            model_id=model_id,
+            prompt_id=prompt_id,
             prompt_version=prompt_version,
             result=result,
         )
@@ -377,6 +480,8 @@ def write_scores(
     run_id: str,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     output: TriageOutput,
     gold: TriageGold,
@@ -385,6 +490,8 @@ def write_scores(
         run_id=run_id,
         case_id=case_id,
         model_name=model_name,
+        model_id=model_id,
+        prompt_id=prompt_id,
         prompt_version=prompt_version,
         output=output,
         gold=gold,
@@ -426,6 +533,24 @@ def _evidence_fields(output: BaseModel) -> dict[str, EvidenceField]:
     if isinstance(output, PolicyExtraction | SummarizationOutput):
         return output.evidence_fields()
     return {}
+
+
+def _version_candidate(case_id: str, output: BaseModel) -> VersionCandidate | None:
+    if not isinstance(output, PolicyExtraction | SummarizationOutput):
+        return None
+    version = output.version
+    effective = output.effective_date
+    if version.status != "present" or effective.status != "present":
+        return None
+    if not isinstance(version.value, str) or not isinstance(effective.value, str):
+        return None
+    try:
+        effective_date = date.fromisoformat(effective.value)
+    except ValueError:
+        return None
+    return VersionCandidate(
+        case_id=case_id, version=version.value, effective_date=effective_date
+    )
 
 
 def _recoverable_fields(gold: BaseModel) -> list[str]:
@@ -474,6 +599,8 @@ def _score_record(
     task: TaskName,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     result: MetricResult,
 ) -> ScoreRecord:
@@ -494,6 +621,8 @@ def _score_record(
         task=task,
         case_id=case_id,
         model_name=model_name,
+        model_id=model_id,
+        prompt_id=prompt_id,
         prompt_version=prompt_version,
         scorer_version=SCORER_VERSION,
         metric=name,

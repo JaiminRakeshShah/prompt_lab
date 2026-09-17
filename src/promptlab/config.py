@@ -29,6 +29,19 @@ OUTCOME_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(r"\brefund (has been|was|is) (issued|posted|approved)\b", re.IGNORECASE),
+    re.compile(r"\b(we will|we'll|you will|you'll)\b.{0,40}\brefund", re.IGNORECASE),
+    re.compile(r"\breimburse", re.IGNORECASE),
+    re.compile(r"\bwe (approve|deny|denied|decline|declined|reject|rejected)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(claim|dispute|application|loan)\b.{0,30}\b(denied|declined|rejected)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(issue|case|matter|complaint|dispute|request)\b.{0,24}"
+        r"\b(is|has been|have been|was|were)\s+resolved\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bwe('ve| have) updated\b", re.IGNORECASE),
     re.compile(r"\bidentity (has been|is|was) (confirmed|verified)\b", re.IGNORECASE),
 )
 
