@@ -27,9 +27,13 @@ class OllamaAdapter:
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self._settings = Settings.from_env()
+        self._config = next(
+            (item for item in self._settings.models.values() if item.model_id == model_id),
+            None,
+        )
 
     def complete(self, request: CompletionRequest, run_id: str) -> CompletionResult:
-        if not any(config.model_id == self.model_id for config in self._settings.models.values()):
+        if self._config is None:
             record = self._record(
                 request=request,
                 run_id=run_id,
@@ -52,15 +56,7 @@ class OllamaAdapter:
             try:
                 response = httpx.post(
                     f"{self._settings.ollama_base_url}/api/generate",
-                    json={
-                        "model": self.model_id,
-                        "prompt": f"{request.system}\n\n{request.user_content}",
-                        "stream": False,
-                        "options": {
-                            "temperature": request.temperature,
-                            "num_predict": request.max_output_tokens,
-                        },
-                    },
+                    json=self._generate_body(request),
                     timeout=180.0,
                 )
             except (httpx.ConnectError, httpx.TimeoutException):
@@ -163,6 +159,20 @@ class OllamaAdapter:
             )
 
         raise RuntimeError("unreachable")
+
+    def _generate_body(self, request: CompletionRequest) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model_id,
+            "prompt": f"{request.system}\n\n{request.user_content}",
+            "stream": False,
+            "options": {
+                "temperature": request.temperature,
+                "num_predict": request.max_output_tokens,
+            },
+        }
+        if self._config is not None and self._config.think is not None:
+            body["think"] = self._config.think
+        return body
 
     def _record(
         self,

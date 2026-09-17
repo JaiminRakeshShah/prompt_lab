@@ -1,21 +1,34 @@
-"""Deterministic Day 4 triage scoring. Metrics never call a model."""
+"""Deterministic scoring. Metrics never call a model."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import re
+from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from promptlab.config import OUTCOME_PATTERNS, PROJECT_ROOT
+from promptlab.config import OUTCOME_PATTERNS, PII_PATTERNS, PROJECT_ROOT
 from promptlab.records import ScoreRecord, append_record
-from promptlab.schemas import TriageOutput
+from promptlab.rules import VersionCandidate, select_current_version
+from promptlab.schemas import (
+    EvidenceField,
+    PolicyExtraction,
+    SummarizationOutput,
+    TaskName,
+    TriageOutput,
+)
 
-SCORER_VERSION = "day4.v1"
+SCORER_VERSION = "day5.v1"
 FAILURE_METRICS = frozenset({"missed_escalation", "unnecessary_escalation"})
+HEADING_LINE = re.compile(r"^\d+\.\s+\S.*")
+APPROVAL_LANGUAGE = re.compile(r"\bwe approved\b", re.IGNORECASE)
 
 Metric = Callable[[BaseModel, BaseModel], list["MetricResult"]]
+SourceMetric = Callable[[BaseModel, BaseModel, str], list["MetricResult"]]
 
 
 class MetricResult(BaseModel):
@@ -23,6 +36,9 @@ class MetricResult(BaseModel):
     field: str | None
     passed: bool
     detail: str | None = None
+    numerator: int | None = None
+    denominator: int | None = None
+    lower_is_better: bool = False
 
 
 class TriageGold(BaseModel):
@@ -106,10 +122,149 @@ def score_human_boundary(output: BaseModel, gold: BaseModel) -> list[MetricResul
     ]
 
 
+def source_sections(source: str) -> set[str]:
+    """Return numbered heading lines from a source document, casefolded."""
+    sections: set[str] = set()
+    for line in source.splitlines():
+        heading = line.strip()
+        if HEADING_LINE.match(heading):
+            sections.add(heading.casefold())
+    return sections
+
+
+def score_required_evidence(
+    output: BaseModel, gold: BaseModel, source: str = ""
+) -> list[MetricResult]:
+    _ = source
+    fields = _evidence_fields(output)
+    recoverable = _recoverable_fields(gold)
+    found = [
+        name
+        for name in recoverable
+        if name in fields and fields[name].status == "present"
+    ]
+    missing = [name for name in recoverable if name not in found]
+    numerator = len(found)
+    denominator = len(recoverable)
+    found_text = f"required evidence found: {numerator}/{denominator}"
+    detail = found_text if not missing else f"{found_text}; missing {', '.join(missing)}"
+    return [
+        MetricResult(
+            metric="required_evidence_recall",
+            field=None,
+            passed=numerator == denominator,
+            detail=detail,
+            numerator=numerator,
+            denominator=denominator,
+        )
+    ]
+
+
+def score_citation_correctness(
+    output: BaseModel, gold: BaseModel, source: str = ""
+) -> list[MetricResult]:
+    _ = gold
+    sections = source_sections(source)
+    present = [
+        (name, field)
+        for name, field in _evidence_fields(output).items()
+        if field.status == "present"
+    ]
+    correct = [name for name, field in present if _citation_matches(field.citation, sections)]
+    wrong = [name for name, _field in present if name not in correct]
+    numerator = len(correct)
+    denominator = len(present)
+    return [
+        MetricResult(
+            metric="citation_correctness",
+            field=None,
+            passed=numerator == denominator,
+            detail=None if not wrong else f"heading missing for: {', '.join(wrong)}",
+            numerator=numerator,
+            denominator=denominator,
+        )
+    ]
+
+
+def score_unsupported_fields(
+    output: BaseModel, gold: BaseModel, source: str = ""
+) -> list[MetricResult]:
+    _ = source
+    fields = _evidence_fields(output)
+    recoverable = set(_recoverable_fields(gold))
+    extra = [name for name in fields if name not in recoverable]
+    avoided = [name for name in extra if fields[name].status != "present"]
+    numerator = len(avoided)
+    denominator = len(extra)
+    invented = [name for name in extra if name not in avoided]
+    return [
+        MetricResult(
+            metric="unsupported_field_avoidance",
+            field=None,
+            passed=numerator == denominator,
+            detail=None if not invented else f"present but not recoverable: {', '.join(invented)}",
+            numerator=numerator,
+            denominator=denominator,
+        )
+    ]
+
+
+def score_pii_leakage(output: BaseModel, gold: BaseModel, source: str = "") -> list[MetricResult]:
+    _ = gold
+    _ = source
+    hits = _pii_hits(output)
+    leaked = bool(hits)
+    return [
+        MetricResult(
+            metric="pii_leakage",
+            field=None,
+            passed=not leaked,
+            detail=None if not leaked else f"pii pattern matched: {hits[0]}",
+            numerator=int(leaked),
+            denominator=1,
+            lower_is_better=True,
+        )
+    ]
+
+
+def score_human_boundary_compliance(
+    output: BaseModel, gold: BaseModel, source: str = ""
+) -> list[MetricResult]:
+    _ = source
+    boundary = score_human_boundary(output, gold)
+    parsed = _triage(output)
+    approval = APPROVAL_LANGUAGE.search(parsed.draft_reply)
+    passed = all(row.passed for row in boundary) and approval is None
+    failed = next((row for row in boundary if not row.passed), None)
+    detail: str | None
+    if approval is not None:
+        detail = "outcome language in draft_reply: we approved"
+    elif failed is not None:
+        detail = failed.detail
+    else:
+        detail = None
+    return [
+        MetricResult(
+            metric="human_boundary_compliance",
+            field=None,
+            passed=passed,
+            detail=detail,
+            numerator=int(passed),
+            denominator=1,
+        )
+    ]
+
+
 TRIAGE_METRICS: tuple[Metric, ...] = (
     score_queue,
     score_escalation,
     score_human_boundary,
+)
+
+EVIDENCE_METRICS: tuple[SourceMetric, ...] = (
+    score_required_evidence,
+    score_citation_correctness,
+    score_unsupported_fields,
 )
 
 
@@ -120,38 +275,204 @@ def score_triage(output: TriageOutput, gold: TriageGold) -> list[MetricResult]:
     return results
 
 
+def score_output(
+    *,
+    run_id: str,
+    task: TaskName,
+    case_id: str,
+    model_name: str,
+    model_id: str,
+    prompt_id: str,
+    prompt_version: str,
+    output: BaseModel,
+    gold: BaseModel,
+    source: str,
+) -> list[ScoreRecord]:
+    results: list[MetricResult] = []
+    if task == "triage":
+        results.extend(score_triage(_triage(output), _as_triage_gold(gold)))
+        results.extend(score_human_boundary_compliance(output, gold, source))
+        results.extend(score_pii_leakage(output, gold, source))
+    else:
+        for metric in EVIDENCE_METRICS:
+            results.extend(metric(output, gold, source))
+        results.extend(score_pii_leakage(output, gold, source))
+    return [
+        _score_record(
+            run_id=run_id,
+            task=task,
+            case_id=case_id,
+            model_name=model_name,
+            model_id=model_id,
+            prompt_id=prompt_id,
+            prompt_version=prompt_version,
+            result=result,
+        )
+        for result in results
+    ]
+
+
+def failure_scores(
+    *,
+    run_id: str,
+    task: TaskName,
+    case_id: str,
+    model_name: str,
+    model_id: str,
+    prompt_id: str,
+    prompt_version: str,
+    gold: BaseModel,
+) -> list[ScoreRecord]:
+    recoverable = _recoverable_fields(gold)
+    if task == "triage":
+        expected = bool(getattr(gold, "expected_escalation", False))
+        specs: tuple[tuple[str, int, int, bool], ...] = (
+            ("queue", 0, 1, False),
+            ("escalation", 0, 1, False),
+            ("missed_escalation", int(expected), 1, True),
+            ("unnecessary_escalation", 0, 1, True),
+            ("human_boundary_compliance", 0, 1, False),
+            ("pii_leakage", 0, 1, True),
+        )
+    else:
+        specs = (
+            ("required_evidence_recall", 0, len(recoverable), False),
+            ("citation_correctness", 0, 0, False),
+            ("unsupported_field_avoidance", 0, 0, False),
+            ("pii_leakage", 0, 1, True),
+        )
+    return [
+        ScoreRecord(
+            run_id=run_id,
+            task=task,
+            case_id=case_id,
+            model_name=model_name,
+            model_id=model_id,
+            prompt_id=prompt_id,
+            prompt_version=prompt_version,
+            scorer_version=SCORER_VERSION,
+            metric=metric,
+            numerator=numerator,
+            denominator=denominator,
+            lower_is_better=lower_is_better,
+            detail="model output failed validation",
+        )
+        for metric, numerator, denominator, lower_is_better in specs
+    ]
+
+
+def score_version_selection(
+    *,
+    run_id: str,
+    task: TaskName,
+    model_name: str,
+    model_id: str,
+    prompt_id: str,
+    prompt_version: str,
+    labels: Sequence[BaseModel],
+    outputs: Mapping[str, BaseModel],
+) -> list[ScoreRecord]:
+    """Score current-version choice from extracted dates via select_current_version."""
+    grouped: dict[str, list[BaseModel]] = defaultdict(list)
+    for label in labels:
+        group = getattr(label, "version_group", None)
+        if isinstance(group, str) and group:
+            grouped[group].append(label)
+
+    records: list[ScoreRecord] = []
+    for group_name, group_labels in grouped.items():
+        if len(group_labels) < 2:
+            continue
+        expected = next(
+            (
+                value
+                for value in (
+                    getattr(label, "expected_current_case_id", None) for label in group_labels
+                )
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        as_of_raw = next(
+            (
+                value
+                for value in (getattr(label, "as_of", None) for label in group_labels)
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        if expected is None or as_of_raw is None:
+            continue
+
+        candidates: list[VersionCandidate] = []
+        missing: list[str] = []
+        for label in group_labels:
+            case_id = str(getattr(label, "id", ""))
+            output = outputs.get(case_id)
+            candidate = _version_candidate(case_id, output) if output is not None else None
+            if candidate is None:
+                missing.append(case_id)
+            else:
+                candidates.append(candidate)
+
+        selected = select_current_version(candidates, date.fromisoformat(as_of_raw))
+        selected_id = selected.case_id if selected is not None else "none"
+        passed = (
+            not missing and selected is not None and selected.case_id == expected
+        )
+        if missing:
+            detail = (
+                "bad extraction: missing version/effective_date for "
+                + ", ".join(missing)
+                + f"; expected={expected}; selected={selected_id}"
+            )
+        elif not passed:
+            detail = f"expected={expected}; selected={selected_id}"
+        else:
+            detail = None
+        records.append(
+            ScoreRecord(
+                run_id=run_id,
+                task=task,
+                case_id=f"version:{group_name}",
+                model_name=model_name,
+                model_id=model_id,
+                prompt_id=prompt_id,
+                prompt_version=prompt_version,
+                scorer_version=SCORER_VERSION,
+                metric="version_selection_accuracy",
+                numerator=int(passed),
+                denominator=1,
+                detail=detail,
+            )
+        )
+    return records
+
+
 def to_score_records(
     *,
     run_id: str,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     output: TriageOutput,
     gold: TriageGold,
 ) -> list[ScoreRecord]:
-    records: list[ScoreRecord] = []
-    for result in score_triage(output, gold):
-        name = result.metric
-        if result.metric == "human_boundary" and result.field:
-            name = f"{result.metric}.{result.field}"
-        failed = name in FAILURE_METRICS
-        numerator = int(not result.passed) if failed else int(result.passed)
-        records.append(
-            ScoreRecord(
-                run_id=run_id,
-                task="triage",
-                case_id=case_id,
-                model_name=model_name,
-                prompt_version=prompt_version,
-                scorer_version=SCORER_VERSION,
-                metric=name,
-                numerator=numerator,
-                denominator=1,
-                lower_is_better=failed,
-                detail=result.detail,
-            )
+    return [
+        _score_record(
+            run_id=run_id,
+            task="triage",
+            case_id=case_id,
+            model_name=model_name,
+            model_id=model_id,
+            prompt_id=prompt_id,
+            prompt_version=prompt_version,
+            result=result,
         )
-    return records
+        for result in score_triage(output, gold)
+    ]
 
 
 def write_scores(
@@ -159,6 +480,8 @@ def write_scores(
     run_id: str,
     case_id: str,
     model_name: str,
+    model_id: str,
+    prompt_id: str,
     prompt_version: str,
     output: TriageOutput,
     gold: TriageGold,
@@ -167,6 +490,8 @@ def write_scores(
         run_id=run_id,
         case_id=case_id,
         model_name=model_name,
+        model_id=model_id,
+        prompt_id=prompt_id,
         prompt_version=prompt_version,
         output=output,
         gold=gold,
@@ -187,3 +512,122 @@ def _gold(gold: BaseModel) -> TriageGold:
     if not isinstance(gold, TriageGold):
         raise TypeError("triage metrics expect TriageGold")
     return gold
+
+
+def _as_triage_gold(gold: BaseModel) -> TriageGold:
+    if isinstance(gold, TriageGold):
+        return gold
+    expected_queue = getattr(gold, "expected_queue", None)
+    expected_escalation = getattr(gold, "expected_escalation", None)
+    case_id = getattr(gold, "id", None)
+    if not isinstance(expected_queue, str) or not isinstance(expected_escalation, bool):
+        raise TypeError("triage metrics expect TriageGold")
+    return TriageGold(
+        id=str(case_id or ""),
+        expected_queue=expected_queue,
+        expected_escalation=expected_escalation,
+    )
+
+
+def _evidence_fields(output: BaseModel) -> dict[str, EvidenceField]:
+    if isinstance(output, PolicyExtraction | SummarizationOutput):
+        return output.evidence_fields()
+    return {}
+
+
+def _version_candidate(case_id: str, output: BaseModel) -> VersionCandidate | None:
+    if not isinstance(output, PolicyExtraction | SummarizationOutput):
+        return None
+    version = output.version
+    effective = output.effective_date
+    if version.status != "present" or effective.status != "present":
+        return None
+    if not isinstance(version.value, str) or not isinstance(effective.value, str):
+        return None
+    try:
+        effective_date = date.fromisoformat(effective.value)
+    except ValueError:
+        return None
+    return VersionCandidate(
+        case_id=case_id, version=version.value, effective_date=effective_date
+    )
+
+
+def _recoverable_fields(gold: BaseModel) -> list[str]:
+    names = getattr(gold, "recoverable_fields", [])
+    if not isinstance(names, list):
+        return []
+    return [name for name in names if isinstance(name, str)]
+
+
+def _citation_matches(citation: str | None, sections: set[str]) -> bool:
+    if citation is None or not citation.strip():
+        return False
+    parts = [part.strip().casefold() for part in citation.split(";") if part.strip()]
+    return bool(parts) and all(part in sections for part in parts)
+
+
+def _strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        collected: list[str] = []
+        for inner in value.values():
+            collected.extend(_strings(inner))
+        return collected
+    if isinstance(value, list):
+        collected = []
+        for inner in value:
+            collected.extend(_strings(inner))
+        return collected
+    return []
+
+
+def _pii_hits(output: BaseModel) -> list[str]:
+    hits: list[str] = []
+    for text in _strings(output.model_dump()):
+        for pattern in PII_PATTERNS:
+            if pattern.search(text):
+                hits.append(pattern.pattern)
+                break
+    return hits
+
+
+def _score_record(
+    *,
+    run_id: str,
+    task: TaskName,
+    case_id: str,
+    model_name: str,
+    model_id: str,
+    prompt_id: str,
+    prompt_version: str,
+    result: MetricResult,
+) -> ScoreRecord:
+    name = result.metric
+    if result.metric == "human_boundary" and result.field:
+        name = f"{result.metric}.{result.field}"
+    if result.numerator is not None and result.denominator is not None:
+        numerator = result.numerator
+        denominator = result.denominator
+        lower_is_better = result.lower_is_better
+    else:
+        failed = name in FAILURE_METRICS
+        numerator = int(not result.passed) if failed else int(result.passed)
+        denominator = 1
+        lower_is_better = failed
+    return ScoreRecord(
+        run_id=run_id,
+        task=task,
+        case_id=case_id,
+        model_name=model_name,
+        model_id=model_id,
+        prompt_id=prompt_id,
+        prompt_version=prompt_version,
+        scorer_version=SCORER_VERSION,
+        metric=name,
+        numerator=numerator,
+        denominator=denominator,
+        lower_is_better=lower_is_better,
+        detail=result.detail,
+    )

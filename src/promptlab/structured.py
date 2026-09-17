@@ -133,6 +133,7 @@ def _record_outcome(
         case_id=request.case_id,
         model_name=_model_name(adapter.model_id),
         model_id=adapter.model_id,
+        prompt_id=request.prompt_id,
         prompt_version=request.prompt_version,
         succeeded=succeeded,
         repairs=repairs,

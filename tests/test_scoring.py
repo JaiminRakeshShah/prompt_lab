@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict
+
 from promptlab.records import ScoreRecord
-from promptlab.schemas import TriageOutput, TriageOutputWithAnalysis
+from promptlab.schemas import (
+    EvidenceField,
+    PolicyExtraction,
+    TriageOutput,
+    TriageOutputWithAnalysis,
+)
 from promptlab.scoring import (
     SCORER_VERSION,
     TriageGold,
     load_triage_gold,
     score_escalation,
     score_human_boundary,
+    score_output,
     score_queue,
     score_triage,
+    score_version_selection,
+    source_sections,
     to_score_records,
 )
 
@@ -86,6 +96,25 @@ def test_human_boundary_rejects_final_outcome_language() -> None:
     assert bad_by_field["customer_outcome"].passed is True
 
 
+def test_human_boundary_rejects_refund_approve_deny_and_resolved() -> None:
+    allowed = score_human_boundary(
+        _output(draft_reply="We will review the duplicate charge and work to resolve it."),
+        _gold(),
+    )
+    assert all(row.passed for row in allowed)
+    forbidden = [
+        "We will refund the duplicate charge tomorrow.",
+        "Your claim has been denied.",
+        "The issue has been resolved.",
+        "We've updated the address on your accounts.",
+        "We deny this dispute.",
+    ]
+    for text in forbidden:
+        result = score_human_boundary(_output(draft_reply=text), _gold())
+        by_field = {row.field: row for row in result}
+        assert by_field["draft_reply"].passed is False, text
+
+
 def test_score_records_use_existing_contract_and_v2_output() -> None:
     output = TriageOutputWithAnalysis.model_validate(
         {
@@ -97,6 +126,8 @@ def test_score_records_use_existing_contract_and_v2_output() -> None:
         run_id="score-run",
         case_id="T01",
         model_name="mistral",
+        model_id="mistral:7b",
+        prompt_id="triage",
         prompt_version="v2",
         output=output,
         gold=_gold(),
@@ -128,6 +159,7 @@ def test_score_triage_does_not_import_a_model_client() -> None:
     source = inspect.getsource(scoring)
     assert "OllamaAdapter" not in source
     assert "httpx" not in source
+    assert "select_current_version" in source
     results = score_triage(_output(), _gold())
     assert [row.metric for row in results] == [
         "queue",
@@ -137,3 +169,283 @@ def test_score_triage_does_not_import_a_model_client() -> None:
         "human_boundary",
         "human_boundary",
     ]
+
+
+def test_scorer_version_was_incremented() -> None:
+    assert SCORER_VERSION != "day4.v1"
+    assert SCORER_VERSION.startswith("day5.")
+
+
+class EvidenceGold(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    recoverable_fields: list[str]
+    version_group: str | None = None
+    expected_current_case_id: str | None = None
+    as_of: str | None = None
+
+
+def _extraction(**overrides: object) -> PolicyExtraction:
+    payload: dict[str, object] = {
+        "document_status": "valid",
+        "policy_name": EvidenceField(
+            value="Test Policy", status="present", citation="1. Document Control"
+        ),
+        "version": EvidenceField(value="1.0", status="present", citation="1. Document Control"),
+        "effective_date": EvidenceField(value=None, status="absent"),
+        "jurisdictions": EvidenceField(
+            value="Pennsylvania", status="present", citation="2. Scope"
+        ),
+        "beneficial_ownership_threshold": EvidenceField(value=None, status="absent"),
+        "review_frequency": EvidenceField(
+            value="12 months", status="present", citation="4. Review"
+        ),
+        "required_documents": EvidenceField(value=None, status="absent"),
+    }
+    payload.update(overrides)
+    return PolicyExtraction.model_validate(payload)
+
+
+def _extraction_gold(**overrides: object) -> EvidenceGold:
+    payload: dict[str, object] = {
+        "id": "E00",
+        "recoverable_fields": ["policy_name", "version", "jurisdictions", "review_frequency"],
+    }
+    payload.update(overrides)
+    return EvidenceGold.model_validate(payload)
+
+
+def test_source_sections_reads_numbered_headings() -> None:
+    assert source_sections("1. Document Control\nBody\n2. Scope\nText") == {
+        "1. document control",
+        "2. scope",
+    }
+
+
+def test_evidence_recall_citations_and_unsupported_avoidance() -> None:
+    scores = score_output(
+        run_id="test",
+        task="extraction",
+        case_id="E00",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        output=_extraction(),
+        gold=_extraction_gold(),
+        source=(
+            "1. Document Control\nTest Policy 1.0\n2. Scope\nPennsylvania\n"
+            "4. Review\n12 months"
+        ),
+    )
+    by_metric = {score.metric: score for score in scores}
+    assert by_metric["required_evidence_recall"].numerator == 4
+    assert by_metric["required_evidence_recall"].denominator == 4
+    assert by_metric["required_evidence_recall"].detail == "required evidence found: 4/4"
+    assert "%" not in (by_metric["required_evidence_recall"].detail or "")
+    assert by_metric["citation_correctness"].numerator == 4
+    assert by_metric["citation_correctness"].denominator == 4
+    assert by_metric["unsupported_field_avoidance"].numerator == 3
+    assert by_metric["unsupported_field_avoidance"].denominator == 3
+    assert all(row.scorer_version == SCORER_VERSION for row in scores)
+
+
+def test_citation_must_name_a_heading_in_the_source() -> None:
+    output = _extraction(
+        jurisdictions=EvidenceField(
+            value="Pennsylvania", status="present", citation="Pennsylvania"
+        )
+    )
+    scores = score_output(
+        run_id="test",
+        task="extraction",
+        case_id="E00",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        output=output,
+        gold=_extraction_gold(),
+        source=(
+            "1. Document Control\nTest Policy 1.0\n2. Scope\nPennsylvania\n"
+            "4. Review\n12 months"
+        ),
+    )
+    citation = next(row for row in scores if row.metric == "citation_correctness")
+    assert citation.numerator == 3
+    assert citation.denominator == 4
+    assert citation.detail is not None and "jurisdictions" in citation.detail
+
+
+def test_required_evidence_recall_uses_counts_not_percentages() -> None:
+    output = _extraction(
+        jurisdictions=EvidenceField(value=None, status="absent"),
+        review_frequency=EvidenceField(value=None, status="absent"),
+    )
+    scores = score_output(
+        run_id="test",
+        task="extraction",
+        case_id="E00",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        output=output,
+        gold=_extraction_gold(),
+        source="1. Document Control\nTest Policy 1.0\n4. Review\n12 months",
+    )
+    recall = next(row for row in scores if row.metric == "required_evidence_recall")
+    assert recall.numerator == 2
+    assert recall.denominator == 4
+    assert recall.detail is not None
+    assert "2/4" in recall.detail
+    assert "%" not in recall.detail
+
+
+def test_triage_detects_pii_leakage_and_boundary_violation() -> None:
+    output = TriageOutput(
+        queue="fraud_report",
+        escalation_required=False,
+        confidence=0.9,
+        rationale="Unauthorized activity",
+        draft_reply="We approved your claim. Call 215-555-0148.",
+        human_review_required=True,
+        customer_outcome=None,
+    )
+    gold = _gold(id="T00", expected_queue="fraud_report", expected_escalation=False)
+    scores = score_output(
+        run_id="test",
+        task="triage",
+        case_id="T00",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="triage",
+        prompt_version="v1",
+        output=output,
+        gold=gold,
+        source="Unauthorized purchase",
+    )
+    by_metric = {score.metric: score for score in scores}
+    assert by_metric["pii_leakage"].numerator == 1
+    assert by_metric["pii_leakage"].lower_is_better
+    assert by_metric["human_boundary_compliance"].numerator == 0
+
+
+def test_pii_patterns_cover_account_national_id_email_and_telephone() -> None:
+    gold = _gold(id="T00", expected_queue="fraud_report", expected_escalation=False)
+    leaked = [
+        "Account 8812046631 is on file.",
+        "National ID 321-54-9876 was provided.",
+        "Contact marina.ellis@example.test for follow-up.",
+        "Call 215-555-0148.",
+    ]
+    for text in leaked:
+        scores = score_output(
+            run_id="test",
+            task="triage",
+            case_id="T00",
+            model_name="test",
+            model_id="fixture-model",
+            prompt_id="triage",
+            prompt_version="v1",
+            output=_output(draft_reply=text, rationale="Review needed."),
+            gold=gold,
+            source="Unauthorized purchase",
+        )
+        pii = next(row for row in scores if row.metric == "pii_leakage")
+        assert pii.numerator == 1
+        assert pii.lower_is_better is True
+        assert pii.denominator == 1
+
+
+def _version_labels() -> list[EvidenceGold]:
+    shared: dict[str, object] = {
+        "recoverable_fields": [],
+        "version_group": "small-business-periodic-kyc",
+        "expected_current_case_id": "E02",
+        "as_of": "2025-06-01",
+    }
+    return [
+        EvidenceGold.model_validate({"id": "E01", **shared}),
+        EvidenceGold.model_validate({"id": "E02", **shared}),
+    ]
+
+
+def _dated_extraction(version: str, effective: str) -> PolicyExtraction:
+    return _extraction(
+        version=EvidenceField(
+            value=version, status="present", citation="1. Document Control"
+        ),
+        effective_date=EvidenceField(
+            value=effective, status="present", citation="1. Document Control"
+        ),
+    )
+
+
+def test_version_selection_scores_select_current_version() -> None:
+    records = score_version_selection(
+        run_id="test",
+        task="extraction",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        labels=_version_labels(),
+        outputs={
+            "E01": _dated_extraction("1.0", "2024-01-01"),
+            "E02": _dated_extraction("2.0", "2025-01-01"),
+        },
+    )
+    assert len(records) == 1
+    row = records[0]
+    assert row.metric == "version_selection_accuracy"
+    assert row.case_id == "version:small-business-periodic-kyc"
+    assert row.numerator == 1
+    assert row.denominator == 1
+    assert row.detail is None
+    assert row.scorer_version == SCORER_VERSION
+
+
+def test_version_selection_failure_is_attributed_to_bad_extraction() -> None:
+    records = score_version_selection(
+        run_id="test",
+        task="extraction",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        labels=_version_labels(),
+        outputs={
+            "E01": _extraction(),
+            "E02": _dated_extraction("2.0", "2025-01-01"),
+        },
+    )
+    row = records[0]
+    assert row.numerator == 0
+    assert row.detail is not None
+    assert "bad extraction" in row.detail
+    assert "E01" in row.detail
+    assert "expected=E02" in row.detail
+
+
+def test_version_selection_equal_dates_are_scored_from_the_rule() -> None:
+    records = score_version_selection(
+        run_id="test",
+        task="extraction",
+        model_name="test",
+        model_id="fixture-model",
+        prompt_id="extract",
+        prompt_version="v1",
+        labels=_version_labels(),
+        outputs={
+            "E01": _dated_extraction("1.0", "2025-01-01"),
+            "E02": _dated_extraction("2.0", "2025-01-01"),
+        },
+    )
+    row = records[0]
+    assert row.numerator == 0
+    assert row.detail is not None
+    assert "bad extraction" not in row.detail
+    assert "selected=none" in row.detail
+    assert "expected=E02" in row.detail
